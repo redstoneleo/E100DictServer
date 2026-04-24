@@ -1,0 +1,98 @@
+测试的时候：
+
+启动 redis-server.exe
+
+
+celery -A E100DictServer worker --loglevel=info  -P threads
+
+python manage.py makemigrations & python manage.py migrate &  uvicorn E100DictServer.asgi:application --host 0.0.0.0 --port 8000
+
+
+
+
+
+不用管migration错误，因为用了另外一个数据库的原因
+python manage.py runserver 0.0.0.0:8000
+
+
+apt-get install ffmpeg libavcodec-extra
+
+pyinstaller E100本地测试工具.py -F
+python -m nuitka --mode=standalone E100本地测试工具.py
+
+白色的、眼睛   有speech没有英语单词释义
+
+
+F:\BaiduNetdiskDownload\ConsumerSoftwareProject\E100DictServer\dicts\白色的.pcm
+
+47.107.238.252
+root
+WOdeyunMM..123
+
+su - ubuntu
+cd /home/ubuntu/E100DictServer/
+uv python install 3.12
+uv python find 3.12
+uv venv SiteEnv --python 3.12
+source SiteEnv/bin/activate
+
+https://gitee.com/wangnov/uv-custom/releases
+uv pip install django fastcrc qianfan beautifulsoup4 fastcrc pydub openpyxl dashscope redis kombu celery channels channels_redis djangorestframework-simplejwt django-redis websockets gunicorn uvicorn[standard]
+
+
+# 复制 systemd 服务文件
+sudo cp /home/ubuntu/E100DictServer/gunicorn.service /etc/systemd/system/
+
+# 重新加载 systemd
+sudo systemctl daemon-reload
+
+# 启用开机自启
+sudo systemctl enable gunicorn
+
+
+sudo cp /home/ubuntu/E100DictServer/E100DictServer_nginx_gunicorn.conf /etc/nginx/conf.d/E100DictServer_nginx_http.conf
+
+
+cd /home/ubuntu/E100DictServer/ && source SiteEnv/bin/activate; python manage.py makemigrations; python manage.py migrate; python manage.py collectstatic --noinput; sudo systemctl restart gunicorn; sudo systemctl restart nginx
+
+
+https://redis.io/docs/latest/operate/oss_and_stack/install/install-stack/apt/
+然后启动 redis-server.exe
+
+
+测试的时候：
+celery -A E100DictServer worker --loglevel=info  -P threads
+服务器上面的时候
+/etc/systemd/system/celery-e100.service
+
+[Unit]
+Description=Celery Worker for E100DictServer
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+# 你的项目根目录
+WorkingDirectory=/home/ubuntu/E100DictServer
+# 建议使用虚拟环境中的 celery 路径
+ExecStart=/home/ubuntu/E100DictServer/SiteEnv/bin/celery -A E100DictServer worker --loglevel=info -P threads
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+
+
+
+
+
+
+sudo systemctl daemon-reload
+sudo systemctl restart celery-e100
+sudo journalctl -u celery-e100 -f
+
+
+
+
+

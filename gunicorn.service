@@ -1,0 +1,20 @@
+[Unit]
+Description=Gunicorn + Uvicorn for E100DictServer
+After=network.target
+
+[Service]
+Type=notify
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/E100DictServer
+Environment="DJANGO_SETTINGS_MODULE=E100DictServer.settings"
+ExecStart=/home/ubuntu/E100DictServer/SiteEnv/bin/gunicorn E100DictServer.asgi:application -c /home/ubuntu/E100DictServer/gunicorn.conf.py
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=5
+PrivateTmp=true
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
