@@ -8,10 +8,32 @@ import hashlib
 import urllib.parse
 import datetime
 import aiohttp
+import os
+import logging
 from django.conf import settings
 from channels.generic.websocket import AsyncWebsocketConsumer
 from .utils import check_limit_exceeded, add_usage
 from urllib.parse import parse_qs
+
+logger = logging.getLogger('chatbot')
+
+_brtc_session = None
+
+# Token 缓存：key=(device_id, lang, asr_mode) → {"inst_id": ..., "token": ..., "expire_at": float}
+# 每个 token 缓存 4 分钟（百度 token 有效期通常 5 分钟，留 1 分钟余量）
+_brtc_token_cache: dict = {}
+_BRTC_TOKEN_TTL = 240  # seconds
+
+# 设备连接代次：key=device_id → int，每次新 WebSocket 连接递增
+# 用于使旧消费者的 connect_to_brtc 重连循环和预取任务自动退出
+_device_generation: dict = {}
+
+async def _get_brtc_session():
+    global _brtc_session
+    if _brtc_session is None or _brtc_session.closed:
+        connector = aiohttp.TCPConnector(limit=100, keepalive_timeout=3600)
+        _brtc_session = aiohttp.ClientSession(connector=connector)
+    return _brtc_session
 
 class ChatBotConsumer(AsyncWebsocketConsumer):
     async def connect(self):
@@ -43,6 +65,7 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
         
         # Track usage
         self.session_start_time = time.time()
+        logger.info(f"[{self.device.device_id}] WebSocket connected. backend={getattr(settings, 'CHATBOT_BACKEND', 'QWEN')}, lang={self.lang}, asr_mode={self.asr_mode}")
         
         # Establish Connection
         self.qwen_ws = None
@@ -51,17 +74,32 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
         self._response_active = False  # 是否有 AI 回答正在进行
         self._queue = asyncio.Queue()  # 流控发送队列
         self.sender_task = asyncio.create_task(self.sender_loop())  # 启动流控发送任务
+        self._current_voice_buf = bytearray()
         
         self.backend = getattr(settings, "CHATBOT_BACKEND", "QWEN")
+        
+        # 立即下发 audio_config，准许客户端立即发送语音
+        sample_rate = 16000 if self.backend == "BRTC" else 24000
+        await self.send(text_data=json.dumps({
+            "action": "audio_config",
+            "sample_rate": sample_rate
+        }))
+        
+        self.upstream_audio_buffer = bytearray()
+        self.pending_stop_speaking = False
+
         if self.backend == "BRTC":
             self.is_brtc_recording = False
-            self.brtc_tts_ready = False  # BRTC连接建立后会先发送 8-byte心跳包，达到 TTS_BEGIN_SPEAKING 调度才找到周期内的更大 chunks
+            self.brtc_tts_ready = False
+            # 递增设备代次，使旧消费者的 connect_to_brtc 重连循环自动退出
+            dev_id = self.device.device_id
+            _device_generation[dev_id] = _device_generation.get(dev_id, 0) + 1
+            self._connect_gen = _device_generation[dev_id]
+            logger.info(f"[{dev_id}] connect() gen={self._connect_gen}, lang={self.lang}")
             self.backend_task = asyncio.create_task(self.connect_to_brtc())
         else:
             self.backend_task = asyncio.create_task(self.connect_to_qwen())
             
-        # 注意：audio_config 会在后端（Qwen/BRTC）真正连接成功后发送，不在这里发送
-        
         # 启动心跳保活任务
         self._keepalive_task = asyncio.create_task(self.keepalive_loop())
 
@@ -80,7 +118,7 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
                     ping_timeout=10     # 10 秒内收不到 pong 则主动断开重连
                 ) as ws:
                     self.qwen_ws = ws
-                    print(f"[{self.device.device_id}] Connected to Qwen Omni API")
+                    logger.info(f"[{self.device.device_id}] Connected to Qwen Omni API")
 
                     # Configure session for Manual mode
                     await ws.send(json.dumps({
@@ -89,8 +127,8 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
                         "session": {
                             "modalities": ["text", "audio"],
                             "turn_detection": None,
-                            "input_audio_format": "pcm16",#输入音频的格式，固定为pcm16。
-                            "output_audio_format": "pcm24",#输出音频的格式，固定为pcm24。
+                            "input_audio_format": "pcm16",
+                            "output_audio_format": "pcm24",
                             "voice": "Cherry",
                             "input_audio_transcription": {
                                 "model": "gummy-realtime-v1"
@@ -99,11 +137,26 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
                         }
                     }))
                     
-                    # Qwen 后端已就绪，通知客户端
-                    await self.send(text_data=json.dumps({
-                        "action": "audio_config",
-                        "sample_rate": 24000
-                    }))
+                    # 检查是否有未发送的积压录音
+                    if hasattr(self, 'upstream_audio_buffer') and self.upstream_audio_buffer:
+                        audio_b64 = base64.b64encode(self.upstream_audio_buffer).decode('ascii')
+                        await ws.send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "event_id": f"event_{int(time.time() * 1000)}_flush",
+                            "audio": audio_b64
+                        }))
+                        self.upstream_audio_buffer = bytearray()
+                        
+                        if getattr(self, "pending_stop_speaking", False):
+                            await ws.send(json.dumps({
+                                "type": "input_audio_buffer.commit",
+                                "event_id": f"event_{int(time.time() * 1000)}_c"
+                            }))
+                            await ws.send(json.dumps({
+                                "type": "response.create",
+                                "event_id": f"event_{int(time.time() * 1000)}_r"
+                            }))
+                            self.pending_stop_speaking = False
 
                     # Listen endlessly for Aliyun chunks
                     async for message in ws:
@@ -131,6 +184,11 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
             # 新回答开始，解除打断过滤
             self._interrupted = False
             self._response_active = True
+            # 记录从 stop_speaking 到 AI 开始响应的延迟
+            if hasattr(self, '_stop_speaking_time') and self._stop_speaking_time:
+                latency = time.time() - self._stop_speaking_time
+                logger.info(f"[{self.device.device_id}] [LATENCY] stop_speaking → response.created: {latency:.3f}s")
+                self._stop_speaking_time = None
             # 清空之前可能的滞留消息
             while not self._queue.empty():
                 try:
@@ -143,6 +201,16 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
                 return  # 丢弃打断后 Qwen 推来的残余音频
             audio_bytes = base64.b64decode(data["delta"])
             
+            # 记录首包音频到达时间
+            if not getattr(self, '_first_audio_logged', False):
+                self._first_audio_logged = True
+                if hasattr(self, '_response_created_time') and self._response_created_time:
+                    latency = time.time() - self._response_created_time
+                    logger.info(f"[{self.device.device_id}] [LATENCY] response.created → first audio delta: {latency:.3f}s")
+                if hasattr(self, '_stop_speaking_time_ref') and self._stop_speaking_time_ref:
+                    total = time.time() - self._stop_speaking_time_ref
+                    logger.info(f"[{self.device.device_id}] [LATENCY] stop_speaking → first audio: {total:.3f}s (total TTFA)")
+            
             # 使用较小的 chunk 放入队列，方便细粒度限速和打断响应
             CHUNK_SIZE = 2400  # 约 50ms (2400 bytes)
             for i in range(0, len(audio_bytes), CHUNK_SIZE):
@@ -154,11 +222,20 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
                 return  # 同样丢弃残余文字
             self._queue.put_nowait({"type": "text", "data": data["delta"]})
 
+        elif event_type == "conversation.item.input_audio_transcription.completed":
+            # 用户语音识别结果
+            transcript = data.get("transcript", "")
+            if transcript:
+                logger.info(f"[{self.device.device_id}] [ASR] User said: {transcript!r}")
+
         elif event_type in ("response.done", "response.cancelled"):
             self._response_active = False
+            self._first_audio_logged = False
+            self._response_created_time = None
+            self._stop_speaking_time_ref = None
 
         elif event_type == "error":
-            print(f"[Qwen] Error returned: {data}")
+            logger.error(f"[{self.device.device_id}] [Qwen] Error returned: {data}")
 
     def _get_bce_auth(self, ak, sk, method, path, headers):
         timestamp = datetime.datetime.now(datetime.UTC)
@@ -194,20 +271,66 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
         
         return f"{auth_string_prefix}/{';'.join(signed_headers)}/{signature}"
 
+    def _brtc_cache_key(self):
+        return (
+            self.device.device_id,
+            getattr(self, 'lang', ''),
+            getattr(self, 'asr_mode', '')
+        )
+
     async def _generate_brtc_token(self, app_id, ak, sk):
-        """调用 generateAIAgentCall 动态传入 lang 和 asr_mode，获取实例 ID 和 token"""
-        host = "rtc-aiagent.baidubce.com"
-        path = "/api/v1/aiagent/generateAIAgentCall"
+        """调用 generateAIAgentCall 动态传入 lang 和 asr_mode，获取实例 ID 和 token。
         
+        优先使用缓存（TTL 内），避免每次重连都发起 REST 请求。
+        """
+        cache_key = self._brtc_cache_key()
+        cached = _brtc_token_cache.get(cache_key)
+        if cached and time.time() < cached["expire_at"]:
+            print(f"[{self.device.device_id}] Using cached BRTC token (expires in "
+                  f"{cached['expire_at'] - time.time():.0f}s)")
+            return cached["inst_id"], cached["token"]
+
+        return await self._fetch_brtc_token(app_id, ak, sk)
+
+    def _get_brtc_config(self):
+        """构造大模型互动实例配置对象"""
         config_dict = {
-            "audiocodec": "raw16k"
+            "audiocodec": "raw16k",
+            "dfda": True,  # 启用 Digital Full-Duplex Audio
+            "asr_vad_level": getattr(settings, "BRTC_ASR_VAD_LEVEL", 45), # 人声检测灵敏度，默认 45
+            "vol": 2.0,  # 全局 TTS 音量
+            "cloud_3A_url": {
+                "ANS": {
+                    "enable": True,
+                    "preMode": "VH",
+                    "midGainDb": 0,
+                    "dfLimitDb": 10
+                },
+                "AGC": {
+                    "enable": True,
+                    "maxVolume": 60,
+                    "extraGain": 0
+                }
+            }
         }
         if getattr(self, 'lang', None):
             config_dict["lang"] = self.lang
         if getattr(self, 'asr_mode', None):
             config_dict["asr_mode"] = self.asr_mode
         config_dict["user_id"] = self.device.device_id
+        logger.info(f"[{self.device.device_id}] BRTC config: lang={self.lang}, asr_mode={self.asr_mode}")
             
+        return config_dict
+
+    async def _fetch_brtc_token(self, app_id, ak, sk):
+        """实际发起 REST 请求获取新 token，并写入缓存。"""
+        start_time = time.time()
+        host = "rtc-aiagent.baidubce.com"
+        path = "/api/v1/aiagent/generateAIAgentCall"
+        
+        config_dict = self._get_brtc_config()
+        print(f"[{self.device.device_id}] BRTC REST API config: {json.dumps(config_dict, ensure_ascii=False)}")
+        
         payload = {
             "app_id": app_id,
             "config": json.dumps(config_dict)
@@ -223,50 +346,110 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
         headers["Authorization"] = auth_header
         
         url = f"https://{host}{path}"
-        async with aiohttp.ClientSession() as session:
+        session = await _get_brtc_session()
+        try:
             async with session.post(url, headers=headers, data=payload_bytes) as resp:
                 resp_text = await resp.text()
+                duration = time.time() - start_time
                 if resp.status == 200:
                     data = json.loads(resp_text)
                     inst_id = data.get("ai_agent_instance_id")
                     token = data.get("context", {}).get("token")
+                    # 写入缓存
+                    _brtc_token_cache[self._brtc_cache_key()] = {
+                        "inst_id": inst_id,
+                        "token": token,
+                        "expire_at": time.time() + _BRTC_TOKEN_TTL
+                    }
+                    logger.info(f"[{self.device.device_id}] [LATENCY] Fetched new BRTC token in {duration:.3f}s")
                     return inst_id, token
                 else:
+                    logger.warning(f"[{self.device.device_id}] BCE request failed ({resp.status}) in {duration:.3f}s")
                     raise Exception(f"BCE request failed via code {resp.status}: {resp_text}")
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"[{self.device.device_id}] BCE request error in {duration:.3f}s: {e}")
+            raise
+
+    async def _prefetch_brtc_token(self, app_id, ak, sk):
+        """在后台静默预取下一个 token，不抛异常（失败时下次连接再重试）。"""
+        try:
+            # 强制绕过缓存，提前刷新
+            await self._fetch_brtc_token(app_id, ak, sk)
+            print(f"[{self.device.device_id}] BRTC token prefetched successfully")
+        except Exception as e:
+            print(f"[{self.device.device_id}] BRTC token prefetch failed (non-fatal): {e}")
 
     async def connect_to_brtc(self):
-        """与 Baidu RTC 建立连接，先生成实例获取 Token，再连 WebSocket 断开后重连"""
+        """与 Baidu RTC 建立连接。支持两种方式：
+        1. 方式一：服务端 API 获取 Token (安全性高，lang 参数通过 REST API 传递)
+        2. 方式二：AK/SK 直接建连 (建连速度快，但 WebSocket 网关可能不解析 config 中的 lang)
+        """
         app_id = getattr(settings, "BRTC_APP_ID", "")
         ak = getattr(settings, "BRTC_AK", "")
         sk = getattr(settings, "BRTC_SK", "")
+        method = getattr(settings, "BRTC_CONNECTION_METHOD", 1)
+        my_gen = getattr(self, '_connect_gen', 0)
 
         while True:
+            # 代次检查：若已有更新的消费者接管，立即退出
+            current_gen = _device_generation.get(self.device.device_id, 0)
+            if my_gen != current_gen:
+                print(f"[{self.device.device_id}] connect_to_brtc gen={my_gen} stale (current={current_gen}), exiting")
+                return
+
             try:
-                print(f"[{self.device.device_id}] Fetching BRTC token mapping config (lang={getattr(self, 'lang', 'N/A')})...")
-                inst_id, token = await self._generate_brtc_token(app_id, ak, sk)
-                url = f"wss://rtc-aiotgw.exp.bcelive.com/v1/realtime?a={app_id}&id={inst_id}&t={token}&ac=raw16k"
-                
+                ws_start = time.time()
+                token_duration = 0
+                if method == 2:
+                    # 每次重连都重新计算 URL，确保 lang 变更生效
+                    config_json = json.dumps(self._get_brtc_config())
+                    config_b64 = base64.b64encode(config_json.encode('utf-8')).decode('ascii')
+                    url = f"wss://rtc-aiotgw.exp.bcelive.com/v1/realtime?a={app_id}&ak={ak}&sk={sk}&ac=raw16k&c={config_b64}"
+                    print(f"[{self.device.device_id}] Connecting via Method 2 (AK/SK), lang={self.lang}, gen={my_gen}...")
+                else:
+                    print(f"[{self.device.device_id}] Fetching BRTC token via Method 1 (lang={self.lang}, gen={my_gen})...")
+                    token_start = time.time()
+                    inst_id, token = await self._generate_brtc_token(app_id, ak, sk)
+                    token_duration = time.time() - token_start
+                    url = f"wss://rtc-aiotgw.exp.bcelive.com/v1/realtime?a={app_id}&id={inst_id}&t={token}&ac=raw16k"
+                    print(f"[{self.device.device_id}] Token setup: {token_duration:.2f}s")
+
                 async with websockets.connect(
                     url,
                     ping_interval=10,
-                    ping_timeout=10
+                    ping_timeout=10,
+                    compression=None # 原始 PCM 不需要压缩，禁用以减少延迟和 CPU
                 ) as ws:
+                    ws_duration = time.time() - ws_start
                     self.brtc_ws = ws
-                    print(f"[{self.device.device_id}] Connected to BRTC Omni API")
-                    
-                    # BRTC 后端已就绪，通知客户端
-                    await self.send(text_data=json.dumps({
-                        "action": "audio_config",
-                        "sample_rate": 16000
-                    }))
+                    print(f"[{self.device.device_id}] Connected to BRTC Omni API (gen={my_gen}). Total: {ws_duration:.2f}s (Token: {token_duration:.2f}s)")
+
+                    # 连接成功后，在后台提前刷新 token，为下次断线重连做准备
+                    # 使用 TTL 的一半时间后触发，确保重连时缓存仍有效
+                    # 捕获当前代次，确保预取不会在旧连接上执行
+                    async def _delayed_prefetch(gen=my_gen):
+                        await asyncio.sleep(_BRTC_TOKEN_TTL / 2)
+                        if _device_generation.get(self.device.device_id, 0) != gen:
+                            print(f"[{self.device.device_id}] Prefetch skipped: gen={gen} stale")
+                            return
+                        await self._prefetch_brtc_token(app_id, ak, sk)
+                    asyncio.create_task(_delayed_prefetch())
 
                     async for message in ws:
                         await self.handle_brtc_message(message)
 
             except Exception as e:
-                print(f"[{self.device.device_id}] BRTC disconnected: {e}, reconnecting in 2s...")
+                print(f"[{self.device.device_id}] BRTC disconnected (gen={my_gen}): {e}, reconnecting in 2s...")
                 self.brtc_ws = None
                 self._interrupted = True
+                # 连接断开时使缓存失效，下次重连强制获取新 token
+                _brtc_token_cache.pop(self._brtc_cache_key(), None)
+
+            # 代次检查（重连前）
+            if _device_generation.get(self.device.device_id, 0) != my_gen:
+                print(f"[{self.device.device_id}] connect_to_brtc gen={my_gen} stale after disconnect, exiting")
+                return
 
             try:
                 if self.channel_layer is None and not hasattr(self, 'channel_name'):
@@ -279,13 +462,28 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
         if isinstance(message, str):
             if message.startswith("[E]:[LIC]:[MUST]"):
                 lic = getattr(settings, "BRTC_LIC_KEY", "")
-                dev_id = self.device.device_id
+                dev_id = self.device.device_id if hasattr(self, 'device') and self.device else "unknown"
                 active_msg = f'[E]:[LIC]:[ACTIVE]:{{"devId":"{dev_id}","uId":"{dev_id}","licKey":"{lic}"}}'
                 await self.brtc_ws.send(active_msg)
                 await self.brtc_ws.send('[E]:[CMD]:[ASR_DISABLE_REALTIME]')
+                
+                if hasattr(self, 'upstream_audio_buffer') and self.upstream_audio_buffer:
+                    if not getattr(self, "is_brtc_recording", False):
+                        await self.brtc_ws.send('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')
+                        self.is_brtc_recording = True
+                        
+                    await self.brtc_ws.send(self.upstream_audio_buffer)
+                    self.upstream_audio_buffer = bytearray()
+                    
+                    if getattr(self, "pending_stop_speaking", False):
+                        await self.brtc_ws.send('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')
+                        self.is_brtc_recording = False
+                        self.pending_stop_speaking = False
             
             elif message.startswith("[Q]:") and not message.startswith("[Q]:[M]:"):
-                self._queue.put_nowait({"type": "text", "data": message[4:]})
+                text = message[4:]
+                logger.info(f"[{self.device.device_id}] [ASR] User said: {text!r}")
+                self._queue.put_nowait({"type": "text", "data": text})
             
             elif message.startswith('[E]:[TTS_BEGIN_SPEAKING]'):
                 self.brtc_tts_ready = True
@@ -355,6 +553,7 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
                     try:
                         await self.send(text_data=json.dumps({
                             "action": "transcript",
+                            "role": item.get("role", "ai"),
                             "text": item["data"]
                         }))
                     except Exception:
@@ -386,6 +585,36 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
         if hasattr(self, 'brtc_ws') and self.brtc_ws:
             await self.brtc_ws.close()
 
+    def _save_voice_log(self, voice_data):
+        if not voice_data:
+            return
+        log_dir = os.path.join(settings.BASE_DIR, 'logs', 'voices')
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.datetime.now()
+        timestamp_str = timestamp.strftime('%Y%m%d_%H%M%S_%f')
+        device_id = self.device.device_id if hasattr(self, 'device') and self.device else "unknown"
+        filename = f"{timestamp_str}_{device_id}.pcm"
+        filepath = os.path.join(log_dir, filename)
+        
+        try:
+            with open(filepath, 'wb') as f:
+                f.write(voice_data)
+            
+            log_file = os.path.join(log_dir, 'voice_metadata.txt')
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"[{timestamp}] Device: {device_id}, Audio Length: {len(voice_data)} bytes\n")
+                
+            files = [os.path.join(log_dir, f) for f in os.listdir(log_dir) if f.endswith('.pcm')]
+            files.sort(key=os.path.getmtime)
+            while len(files) > 20:
+                oldest = files.pop(0)
+                try:
+                    os.remove(oldest)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Failed to record voice log: {e}")
+
     async def receive(self, text_data=None, bytes_data=None):
         if text_data:
             try:
@@ -393,21 +622,41 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
                 action = data.get("action")
                 
                 if action == "stop_speaking":
-                    if getattr(self, "backend", "QWEN") == "QWEN" and getattr(self, "qwen_ws", None):
-                        # Once button is released, flush buffer and generate response in manual mode
-                        await self.qwen_ws.send(json.dumps({
-                            "type": "input_audio_buffer.commit",
-                            "event_id": f"event_{int(time.time() * 1000)}_c"
-                        }))
-                        await self.qwen_ws.send(json.dumps({
-                            "type": "response.create",
-                            "event_id": f"event_{int(time.time() * 1000)}_r"
-                        }))
-                    elif getattr(self, "backend", "QWEN") == "BRTC" and getattr(self, "brtc_ws", None):
-                        await self.brtc_ws.send('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')
-                        self.is_brtc_recording = False
+                    if hasattr(self, '_current_voice_buf') and self._current_voice_buf:
+                        self._save_voice_log(self._current_voice_buf)
+                        self._current_voice_buf = bytearray()
+
+                    if getattr(self, "backend", "QWEN") == "QWEN":
+                        if getattr(self, "qwen_ws", None):
+                            # Once button is released, flush buffer and generate response in manual mode
+                            await self.qwen_ws.send(json.dumps({
+                                "type": "input_audio_buffer.commit",
+                                "event_id": f"event_{int(time.time() * 1000)}_c"
+                            }))
+                            await self.qwen_ws.send(json.dumps({
+                                "type": "response.create",
+                                "event_id": f"event_{int(time.time() * 1000)}_r"
+                            }))
+                        else:
+                            self.pending_stop_speaking = True
+                            
+                    elif getattr(self, "backend", "QWEN") == "BRTC":
+                        if getattr(self, "brtc_ws", None):
+                            await self.brtc_ws.send('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')
+                            self.is_brtc_recording = False
+                        else:
+                            self.pending_stop_speaking = True
                 
                 elif action == "interrupt":
+                    if hasattr(self, '_current_voice_buf') and self._current_voice_buf:
+                        self._save_voice_log(self._current_voice_buf)
+                        self._current_voice_buf = bytearray()
+
+                    # 处于连接中断期间直接清空离线缓存
+                    if not getattr(self, "qwen_ws" if getattr(self, "backend", "QWEN") == "QWEN" else "brtc_ws", None):
+                        self.upstream_audio_buffer = bytearray()
+                        self.pending_stop_speaking = False
+
                     # 只在有 AI 回答正在进行时才打断，避免误设 _interrupted 导致后续回复被丢弃
                     if not self._response_active:
                         # 没有正在进行的回答，只清空输入缓冲区即可
@@ -436,28 +685,46 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
                             "type": "input_audio_buffer.clear",
                             "event_id": f"event_{int(time.time() * 1000)}_clr"
                         }))
-                    elif getattr(self, "backend", "QWEN") == "BRTC":
+                    elif getattr(self, "backend", "QWEN") == "BRTC" and getattr(self, "brtc_ws", None):
+                        if getattr(self, "is_brtc_recording", False):
+                            await self.brtc_ws.send('[E]:[CMD]:[ASR_STOP_LONGTEXT_REC]')
                         self.is_brtc_recording = False
             except json.JSONDecodeError:
                 pass
                 
         if bytes_data:
+            if hasattr(self, '_current_voice_buf'):
+                self._current_voice_buf.extend(bytes_data)
+
             # Append audio buffers block-by-block while device button is held
-            if getattr(self, "backend", "QWEN") == "QWEN" and getattr(self, "qwen_ws", None):
-                audio_b64 = base64.b64encode(bytes_data).decode('ascii')
-                try:
-                    await self.qwen_ws.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "event_id": f"event_{int(time.time() * 1000)}_a",
-                        "audio": audio_b64
-                    }))
-                except websockets.exceptions.ConnectionClosed:
-                    pass
-            elif getattr(self, "backend", "QWEN") == "BRTC" and getattr(self, "brtc_ws", None):
-                try:
-                    if getattr(self, "is_brtc_recording", False) == False:
-                        await self.brtc_ws.send('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')
-                        self.is_brtc_recording = True
-                    await self.brtc_ws.send(bytes_data)
-                except websockets.exceptions.ConnectionClosed:
-                    pass
+            if getattr(self, "backend", "QWEN") == "QWEN":
+                ws = getattr(self, "qwen_ws", None)
+                if ws:
+                    audio_b64 = base64.b64encode(bytes_data).decode('ascii')
+                    try:
+                        await ws.send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "event_id": f"event_{int(time.time() * 1000)}_a",
+                            "audio": audio_b64
+                        }))
+                    except websockets.exceptions.ConnectionClosed:
+                        pass
+                else:
+                    if not hasattr(self, 'upstream_audio_buffer'):
+                        self.upstream_audio_buffer = bytearray()
+                    self.upstream_audio_buffer.extend(bytes_data)
+                    
+            elif getattr(self, "backend", "QWEN") == "BRTC":
+                ws = getattr(self, "brtc_ws", None)
+                if ws:
+                    try:
+                        if getattr(self, "is_brtc_recording", False) == False:
+                            await ws.send('[E]:[CMD]:[ASR_START_LONGTEXT_REC]')
+                            self.is_brtc_recording = True
+                        await ws.send(bytes_data)
+                    except websockets.exceptions.ConnectionClosed:
+                        pass
+                else:
+                    if not hasattr(self, 'upstream_audio_buffer'):
+                        self.upstream_audio_buffer = bytearray()
+                    self.upstream_audio_buffer.extend(bytes_data)

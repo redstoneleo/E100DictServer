@@ -68,7 +68,6 @@ LANG_OPTIONS = [
     ("苏州话  lang=zh_su",        "zh_su"),
     # ── 纯外语 ───────────────────────────────────────────────────────────────
     ("── 纯外语场景 ──",          None),
-    ("纯英语  lang=en&asr_mode=onlyEn", "en&asr_mode=onlyEn"),
     ("日语    lang=ja",            "ja"),
     ("西班牙语 lang=es",           "es"),
     ("俄语    lang=ru",            "ru"),
@@ -130,10 +129,11 @@ class AudioController(QObject):
         self._playback_thread = threading.Thread(target=self._playback_worker, daemon=True)
         self._playback_thread.start()
 
+        self._cache_file = os.path.join(os.path.dirname(__file__), ".simulator_cache.json")
         self.get_auth_credentials()
 
     def _post_json(self, url: str, payload: dict, timeout: int = 10) -> dict:
-        """发送 JSON POST 请求"""
+        """发送 JSON POST 请求 (优化：禁用系统代理探测以加速本地连接)"""
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url=url,
@@ -142,10 +142,12 @@ class AudioController(QObject):
             method="POST",
         )
         parsed = urlparse(url)
-        ctx = ssl.create_default_context() if parsed.scheme == "https" else None
+        # 核心优化：显式指定不使用代理，避免 Windows 下 urllib 的代理搜索延迟
+        proxy_handler = urllib.request.ProxyHandler({})
+        opener = urllib.request.build_opener(proxy_handler)
 
         try:
-            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            with opener.open(req, timeout=timeout) as resp:
                 body = resp.read().decode("utf-8")
                 return json.loads(body) if body else {}
         except Exception as e:
@@ -371,9 +373,48 @@ class AudioController(QObject):
         await self._interrupt_if_possible()
         return self.ws is not None
 
+    def _load_cache(self):
+        """尝试从本地文件加载有效的认证缓存"""
+        if not os.path.exists(self._cache_file):
+            return None
+        try:
+            with open(self._cache_file, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+                # 检查缓存是否属于当前服务器且未过期 (缓存效期 1 小时)
+                if (cache_data.get("server_host") == self.server_config["host"] and
+                    cache_data.get("server_type") == self.server_type and
+                    time.time() - cache_data.get("timestamp", 0) < 3600):
+                    return cache_data
+        except Exception:
+            pass
+        return None
+
+    def _save_cache(self, access_token):
+        """仅保存 access_token 到本地"""
+        try:
+            cache_data = {
+                "access_token": access_token,
+                "server_host": self.server_config["host"],
+                "server_type": self.server_type,
+                "timestamp": time.time()
+            }
+            with open(self._cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f)
+        except Exception as e:
+            print(f"[缓存] 保存失败: {e}")
+
     def get_auth_credentials(self):
-        """获取认证凭证"""
-        self._init_error = None  # 每次认证前重置错误状态
+        """获取认证凭证 (Token 尝试使用缓存，Nonce 始终获取最新的)"""
+        start_time = time.time()
+        self._init_error = None
+        access_token = None
+
+        # 1. 尝试从缓存读取 access_token
+        cached = self._load_cache()
+        if cached:
+            access_token = cached.get("access_token")
+            print(f"[认证] 发现本地有效 Token，跳过 Token 申请步骤。")
+
         try:
             config = self.server_config
             device_id = config["device_id"]
@@ -381,78 +422,68 @@ class AudioController(QObject):
             http_base = f"{config['http_scheme']}://{config['host']}"
             ws_base = f"{config['ws_scheme']}://{config['host']}"
 
-            print(f"[配置] 服务器: {config['name']} ({config['host']})")
-            print(f"[配置] 设备 ID: {device_id}")
-
-            # 1) 获取 nonce_token
-            print("[认证] 步骤 1/5: 获取 nonce_token...")
-            nonce_token = self._post_json(
-                f"{http_base}/device/challenge/",
-                {"device_id": device_id}
-            ).get("nonce")
-            
-            if not nonce_token:
-                raise RuntimeError("device/challenge 未返回 nonce")
-            print(f"[认证] 获得 nonce_token: {nonce_token[:20]}...")
-
-            # 2) 签名 nonce_token
-            print("[认证] 步骤 2/5: 签名 nonce_token...")
-            sig_token = hmac.new(
-                device_secret.encode("utf-8"),
-                nonce_token.encode("utf-8"),
-                hashlib.sha256,
-            ).hexdigest()
-
-            # 3) 获取 access_token
-            print("[认证] 步骤 3/5: 获取 access_token...")
-            token_resp = self._post_json(
-                f"{http_base}/device/token/",
-                {"device_id": device_id, "signature": sig_token}
-            )
-            access_token = token_resp.get("access")
-            
+            # 2. 如果没有缓存 Token，则执行步骤 1-3 获取它
             if not access_token:
-                raise RuntimeError("device/token 未返回 access token")
-            print(f"[认证] 获得 access_token: {access_token[:30]}...")
+                print(f"[配置] 服务器: {config['name']} ({config['host']})")
+                print(f"[配置] 设备 ID: {device_id}")
 
-            # 4) 获取 nonce_ws
-            print("[认证] 步骤 4/5: 获取 nonce_ws...")
-            nonce_ws = self._post_json(
-                f"{http_base}/device/challenge/",
-                {"device_id": device_id}
-            ).get("nonce")
-            
-            if not nonce_ws:
-                raise RuntimeError("device/challenge 未返回 nonce for ws")
+                # 1) 获取 nonce_token
+                t1 = time.time()
+                print("[认证] 步骤 1/5: 获取 nonce_token...")
+                nonce_token = self._post_json(f"{http_base}/device/challenge/", {"device_id": device_id}).get("nonce")
+                if not nonce_token: raise RuntimeError("device/challenge 未返回 nonce")
+                t2 = time.time()
+                print(f"[认证] 获得 nonce_token (耗时: {t2-t1:.2f}s)")
 
-            # 5) 签名 nonce_ws
+                # 2) 签名 nonce_token
+                sig_token = hmac.new(device_secret.encode("utf-8"), nonce_token.encode("utf-8"), hashlib.sha256).hexdigest()
+
+                # 3) 获取 access_token
+                t3 = time.time()
+                print("[认证] 步骤 3/5: 获取 access_token...")
+                token_resp = self._post_json(f"{http_base}/device/token/", {"device_id": device_id, "signature": sig_token})
+                access_token = token_resp.get("access")
+                if not access_token: raise RuntimeError("device/token 未返回 access token")
+                t4 = time.time()
+                print(f"[认证] 获得 access_token (耗时: {t4-t3:.2f}s)")
+                
+                # 存入缓存
+                self._save_cache(access_token)
+
+            # 3. 始终执行步骤 4-5 获取新鲜的 WebSocket Nonce
+            t5 = time.time()
+            print("[认证] 步骤 4/5: 获取新鲜 WebSokect nonce_ws...")
+            nonce_ws = self._post_json(f"{http_base}/device/challenge/", {"device_id": device_id}).get("nonce")
+            if not nonce_ws: raise RuntimeError("device/challenge 未返回 nonce for ws")
+            t6 = time.time()
+            print(f"[认证] 获得 nonce_ws (耗时: {t6-t5:.2f}s)")
+
             print("[认证] 步骤 5/5: 签名 nonce_ws...")
-            sign_ws = hmac.new(
-                device_secret.encode("utf-8"),
-                nonce_ws.encode("utf-8"),
-                hashlib.sha256,
-            ).hexdigest()
+            sign_ws = hmac.new(device_secret.encode("utf-8"), nonce_ws.encode("utf-8"), hashlib.sha256).hexdigest()
 
-            # 构造 WebSocket URL
+            # 4. 构造 WebSocket URL
             params = {"token": access_token, "nonce": nonce_ws, "sign": sign_ws}
             if self.lang_type:
-                # 处理可能包含多个参数的情况，例如 "en&asr_mode=onlyEn"
-                for param_pair in self.lang_type.split('&'):
-                    if '=' in param_pair:
-                        k, v = param_pair.split('=', 1)
-                        params[k] = v
-                    else:
-                        params["lang"] = param_pair
+                params["lang"] = self.lang_type
             qs = urlencode(params)
             self.ws_url = f"{ws_base}/ws/chatbot/?{qs}"
             self._ws_url_seq = self._desired_connection_seq
-            print(f"[认证] 认证成功！")
+            print(f"[认证] 全流程成功！总耗时: {time.time()-start_time:.2f}s")
             
         except Exception as e:
             self.ws_url = None
             self._ws_url_seq = 0
             self._init_error = f"{type(e).__name__}: {e}"
-            print(f"[错误] 认证失败: {self._init_error}")
+            print(f"[错误] 认证失败: {self._init_error} (总耗时: {time.time()-start_time:.2f}s)")
+            # 如果认证失败（可能是 Token 过期），尝试删除缓存
+            if os.path.exists(self._cache_file):
+                os.remove(self._cache_file)
+            
+        except Exception as e:
+            self.ws_url = None
+            self._ws_url_seq = 0
+            self._init_error = f"{type(e).__name__}: {e}"
+            print(f"[错误] 认证失败: {self._init_error} (总耗时: {time.time()-start_time:.2f}s)")
 
     async def connect_websocket(self):
         if self._init_error:
@@ -462,26 +493,37 @@ class AudioController(QObject):
             self.status_signal.emit("❌ 未配置 ws_url")
             return
 
+        start_time = time.time()
         server_name = self.server_config["name"]
-        self.status_signal.emit(f"正在连接到 {server_name}...")
+        status_text = f"正在连接到 {server_name}..."
+        self.status_signal.emit(status_text)
         try:
             # 根据服务器类型决定是否使用 SSL
             ssl_ctx = ssl.create_default_context() if self.server_config["ws_scheme"] == "wss" else None
             self._backend_ready.clear()  # 新连接，后端尚未就绪（即便 update_lang 已 clear，此处再 clear 一次保险）
+            print(f"[网络] 正在建立 WebSocket 连接: {self.ws_url[:60]}...")
+            
+            # 核心优化：强制使用 IPv4 (family=2)，避免某些环境下 IPv6 优先探测导致的数秒延迟
+            # 同时适当调小 open_timeout
+            import socket
             self.ws = await websockets.connect(
                 self.ws_url,
                 ssl=ssl_ctx,
-                open_timeout=10,
+                open_timeout=5,
                 ping_interval=30,    # 每30秒发送心跳
                 ping_timeout=10,     # 10秒内没收到pong则断开
-                close_timeout=10
+                close_timeout=10,
+                family=socket.AF_INET
             )
             self._active_connection_seq = self._ws_url_seq
-            self.status_signal.emit(f"✅ 已连接到 {server_name}")
+            duration = time.time() - start_time
+            print(f"[网络] WebSocket 已连接，耗时: {duration:.2f}s")
+            self.status_signal.emit(f"✅ 已连接到 {server_name} (握手: {duration:.2f}s)")
             asyncio.create_task(self.listen_for_messages())
         except Exception as e:
             self.ws = None
             self.status_signal.emit(f"❌ 连接失败: {type(e).__name__}: {e}")
+            print(f"[错误] WebSocket 连接失败: {e}")
 
     async def listen_for_messages(self):
         """监听服务器消息，断线后自动重连"""
@@ -502,6 +544,7 @@ class AudioController(QObject):
                             rate = data.get("sample_rate", 24000)
                             self._set_out_rate(rate)
                             self._backend_ready.set()  # 后端已就绪
+                            print(f"[业务] 收到 audio_config，后端已就绪 (sample_rate: {rate})")
                             
                         if action == "transcript":
                             text = data.get("text", "")
@@ -528,8 +571,16 @@ class AudioController(QObject):
             await self.connect_websocket()
         except Exception as e:
             self.ws = None
-            print(f"监听消息时出错: {e}")
-            self.status_signal.emit(f"❌ 连接错误: {type(e).__name__}")
+            err_msg = f"{type(e).__name__}: {e}"
+            self.status_signal.emit(f"❌ 连接错误: {err_msg}")
+            print(f"[错误] 监听消息时出错: {err_msg}")
+            
+            # 如果收到 4001 错误，说明 Token 或 Nonce 失效，清除缓存
+            if "4001" in str(e):
+                print("[系统] 检测到授权失效(4001)，准备重新获取认证...")
+                if os.path.exists(self._cache_file):
+                    os.remove(self._cache_file)
+                self.get_auth_credentials()
 
     def play_audio(self, audio_bytes):
         """将音频块放入队列"""

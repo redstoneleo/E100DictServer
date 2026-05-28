@@ -24,10 +24,13 @@ urlpatterns = [
     path("ChatBot/", include("ChatBot.urls")),
     path("device/", include("Device.urls")),
     path("VoiceToImage/", include("VoiceToImage.urls")),
+    path("image2video/", include("image2video.urls")),
     path("admin/", admin.site.urls),
     path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
 ]
 
 if settings.DEBUG:
     from django.contrib.staticfiles.urls import staticfiles_urlpatterns
+    from django.conf.urls.static import static
     urlpatterns+=staticfiles_urlpatterns()
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

@@ -9,7 +9,7 @@ https://docs.djangoproject.com/en/4.2/topics/settings/
 For the full list of settings and their values, see
 https://docs.djangoproject.com/en/4.2/ref/settings/
 """
-import os
+import os,sys
 from pathlib import Path
 from datetime import timedelta
 
@@ -24,7 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = "django-insecure-+nkivu&j7#rpd!lnj5ojgv^&v+2$(j4129q)*-l=20m*hol1^0"
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = True#sys.platform == "win32"
 
 ALLOWED_HOSTS = ["*"]
 
@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     'ChatBot.apps.ChatbotConfig',
 
     'Device.apps.DeviceConfig',
+    'image2video.apps.Image2VideoConfig',
 
     "django.contrib.admin",
     "django.contrib.auth",
@@ -207,3 +208,46 @@ BRTC_APP_ID = "appsd9wbv9a0vuw"
 BRTC_AK = "ALTAKmIrCwULTQ8ENTMkgKNiWi"
 BRTC_SK = "c8ab2929d4be44918de7a312249c9587"
 BRTC_LIC_KEY = "c705b2e602f94f17a483cd12681e11f3"
+BRTC_CONNECTION_METHOD = 1 # 1: Token (REST API, 支持 lang 参数), 2: AK/SK direct (WebSocket 网关, lang 参数可能不生效)
+BRTC_ASR_VAD_LEVEL = 20 # 人声检测灵敏度 (范围建议: 更低对小声音敏感，更高抗噪)
+
+# Logging Configuration
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'chatbot': {
+            'format': '[{asctime}] [{levelname}] {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'chatbot',
+        },
+    },
+    'loggers': {
+        'chatbot': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+    },
+}
+
+# 尝试启用文件日志（如果失败则只用 console）
+try:
+    _log_dir = os.path.join(BASE_DIR, 'logs')
+    os.makedirs(_log_dir, exist_ok=True)
+    LOGGING['handlers']['chatbot_file'] = {
+        'class': 'logging.handlers.RotatingFileHandler',
+        'filename': os.path.join(_log_dir, 'chatbot.log'),
+        'maxBytes': 10 * 1024 * 1024,  # 10 MB
+        'backupCount': 5,
+        'encoding': 'utf-8',
+        'formatter': 'chatbot',
+    }
+    LOGGING['loggers']['chatbot']['handlers'].append('chatbot_file')
+except Exception as e:
+    print(f"Warning: Could not configure file logging: {e}")
