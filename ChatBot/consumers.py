@@ -403,11 +403,12 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
             "asr_vad_level": getattr(settings, "BRTC_ASR_VAD_LEVEL", 45)  # 人声检测灵敏度，默认 45
         }
 
-        # TTS参数：针对韩语降低音量以避免溢出
-        if getattr(self, 'lang', '') == 'ko':
-            config_dict["vol"] = 0.3  # 显著降低音量
-        else:
-            config_dict["vol"] = 1.0
+        # TTS参数：vol 必须放在 tts_url 子参数中（文档：tts_url中支持的参数配置）
+        # 顶层 config 不支持 vol，需嵌套在 "DEFAULT{...}" 格式的 tts_url 内
+        vol = 0.3 if getattr(self, 'lang', '') == 'ko' else 1.0  # 韩语降低音量以避免溢出
+        tts_url_params = {"vol": vol, "spd": 1.0}
+        config_dict["tts"] = "DEFAULT"
+        config_dict["tts_url"] = "DEFAULT" + json.dumps(tts_url_params)
             
         config_dict["cloud_3A_url"] = {
             "ANS": {
