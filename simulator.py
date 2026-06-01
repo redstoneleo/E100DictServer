@@ -28,6 +28,9 @@ CHANNELS = 1
 RATE = 16000        # 录音/上行采样率（16kHz）
 OUT_RATE = 16000    # 播放/下行采样率（BRTC 输出为 16kHz，Qwen 为 24kHz 由 audio_config 动态切换）
 
+# 调试开关：设为 True 将收到的原始 PCM 音频保存到文件，用于离线分析滋滋声问题
+SAVE_DEBUG_AUDIO = True
+
 #####################################
 # 服务器配置
 #####################################
@@ -131,6 +134,20 @@ class AudioController(QObject):
 
         self._cache_file = os.path.join(os.path.dirname(__file__), ".simulator_cache.json")
         self.get_auth_credentials()
+        
+        # 调试：保存原始 PCM 音频到文件
+        if SAVE_DEBUG_AUDIO:
+            import datetime as _dt
+            ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._debug_audio_file = os.path.join(
+                os.path.dirname(__file__), f"debug_audio_{self.lang_type or 'default'}_{ts}.pcm"
+            )
+            self._debug_audio_fh = open(self._debug_audio_file, "wb")
+            self._debug_audio_chunks = 0
+            self._debug_audio_bytes = 0
+            print(f"[调试] 原始音频保存到: {self._debug_audio_file}")
+        else:
+            self._debug_audio_fh = None
 
     def _post_json(self, url: str, payload: dict, timeout: int = 10) -> dict:
         """发送 JSON POST 请求 (优化：禁用系统代理探测以加速本地连接)"""
@@ -191,6 +208,12 @@ class AudioController(QObject):
             except Exception:
                 pass
             self.out_stream = None
+        if self._debug_audio_fh:
+            self._debug_audio_fh.close()
+            print(f"[调试] 音频文件已关闭: {self._debug_audio_file} "
+                  f"(共 {self._debug_audio_chunks} 块, {self._debug_audio_bytes} 字节, "
+                  f"≈{self._debug_audio_bytes / 32000:.2f}s)")
+            self._debug_audio_fh = None
 
     def _set_out_rate(self, rate):
         """动态修改回放采样率（如果发生变化则重建流）"""
@@ -205,22 +228,43 @@ class AudioController(QObject):
                 self.out_stream = None
 
     def _playback_worker(self):
-        """独立线程：持续从队列取音频块并播放"""
+        """独立线程：持续从队列取音频块并播放。
+        
+        关键修复：BRTC 发送的音频块可能只有 640B (20ms)，
+        直接逐块写入 PyAudio 会导致时序过紧、缓冲欠载、产生杂音。
+        这里缓冲至少 100ms (3200B) 再写入，给 PyAudio 足够的播放余量。
+        """
+        buf = bytearray()
+        MIN_WRITE = 3200  # 100ms at 16kHz 16-bit mono
+        FLUSH_TIMEOUT = 0.15  # 150ms 无新数据则刷新残余缓冲
+        
         while True:
             try:
                 audio_bytes = self._audio_queue.get(timeout=0.05)
                 if audio_bytes is None:   # 哨兵值，退出线程
                     break
                 if self.is_recording:     # 录音期间丢弃残余音频
+                    buf.clear()
                     continue
-                stream = self._ensure_out_stream()
-                if stream:
-                    try:
-                        stream.write(audio_bytes)
-                    except OSError as e:
-                        print(f"Audio playback error: {e}")
+                buf.extend(audio_bytes)
+                if len(buf) >= MIN_WRITE:
+                    stream = self._ensure_out_stream()
+                    if stream:
+                        try:
+                            stream.write(bytes(buf))
+                        except OSError as e:
+                            print(f"Audio playback error: {e}")
+                    buf.clear()
             except queue.Empty:
-                pass
+                # flush 残余缓冲（TTS 播完后不会再有新数据）
+                if buf:
+                    stream = self._ensure_out_stream()
+                    if stream:
+                        try:
+                            stream.write(bytes(buf))
+                        except OSError:
+                            pass
+                    buf.clear()
 
     def update_lang(self, new_lang_type: str):
         """在主界面切换语言时调用：立即在后台重认证并重连，
@@ -560,32 +604,52 @@ class AudioController(QObject):
                         pass
         except websockets.exceptions.ConnectionClosed as e:
             self.ws = None
-            print(f"WebSocket 连接断开: {e}")
+            code = getattr(e, "code", None)
+            reason = getattr(e, "reason", "")
+            print(f"WebSocket 连接断开: {code} ({reason})")
+
+            if code == 4001:
+                self.status_signal.emit("❌ 认证失败 (4001)，尝试重新认证...")
+                print("[系统] 检测到授权失效(4001)，准备重新获取认证...")
+                if os.path.exists(self._cache_file):
+                    try: os.remove(self._cache_file)
+                    except: pass
+                # 后台立即刷新认证
+                self.get_auth_credentials()
+                # 稍微多等一会儿再重连
+                await asyncio.sleep(5)
+            elif code == 4002:
+                self.status_signal.emit("⚠️ 达到每日额度限制 (4002)")
+                print("[系统] 达到每日额度限制 (4002)，停止自动重连。")
+                return # 停止重连循环
+            
             # 主动关闭（语言切换）时不自动重连，由 start_recording 负责重连
             if self._intentional_close:
                 self._intentional_close = False
                 return
+            
             self.status_signal.emit("🔄 连接断开，等待重连...")
             # 自动重连（延迟3秒）
             await asyncio.sleep(3)
             await self.connect_websocket()
         except Exception as e:
             self.ws = None
-            err_msg = f"{type(e).__name__}: {e}"
+            err_msg = str(e)
             self.status_signal.emit(f"❌ 连接错误: {err_msg}")
             print(f"[错误] 监听消息时出错: {err_msg}")
-            
-            # 如果收到 4001 错误，说明 Token 或 Nonce 失效，清除缓存
-            if "4001" in str(e):
-                print("[系统] 检测到授权失效(4001)，准备重新获取认证...")
-                if os.path.exists(self._cache_file):
-                    os.remove(self._cache_file)
-                self.get_auth_credentials()
 
     def play_audio(self, audio_bytes):
         """将音频块放入队列"""
         if not self.is_recording:
             self._audio_queue.put(audio_bytes)
+            # 调试：保存原始音频到文件
+            if self._debug_audio_fh:
+                self._debug_audio_chunks += 1
+                self._debug_audio_bytes += len(audio_bytes)
+                self._debug_audio_fh.write(audio_bytes)
+                if self._debug_audio_chunks <= 5 or self._debug_audio_chunks % 20 == 0:
+                    print(f"[调试] 音频块 #{self._debug_audio_chunks}: {len(audio_bytes)}B, 累计 {self._debug_audio_bytes}B "
+                          f"(≈{self._debug_audio_bytes / 32000:.2f}s)")
 
     def stop_playing_audio(self):
         """立即丢弃队列中所有待播放音频"""

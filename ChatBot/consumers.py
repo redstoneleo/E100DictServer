@@ -292,25 +292,134 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
 
         return await self._fetch_brtc_token(app_id, ak, sk)
 
+    @staticmethod
+    def _fix_brtc_overflow(data: bytes, device_id: str = "") -> bytes:
+        """修复 BRTC 韩语 TTS 引擎的 int16 溢出 bug。
+
+        根因：百度 BRTC 韩语 TTS 的 float→int16 转换不钳位，
+        当 float > 1.0 时直接 cast 导致正溢出回绕为负值（符号位翻转），
+        例如 float 1.5 → uint16 49152 → int16 -16384。
+        回绕的样本与相邻样本产生巨大跳变（>30000），听起来就是滋滋声。
+
+        修复策略（两遍处理）：
+        1. 检测相邻样本间异常大的跳变（>JUMP_THRESHOLD），
+           尝试翻转符号解释（正溢出→还原为正值，负溢出→还原为负值），
+           选择跳变更小的那个，然后钳位到 [-32768, 32767]。
+        2. 平滑处理钳位区域：当溢出样本被钳位到极值（±32767）时，
+           用前后正常样本的加权平均值替代，避免与相邻样本产生假跳跃。
+        """
+        n = len(data) // 2
+        if n == 0:
+            return data
+
+        JUMP_THRESHOLD = 25000  # 降低阈值以捕获更多溢出样本
+        SMOOTH_WINDOW = 5       # 平滑窗口大小
+
+        # 第一遍：溢出修复
+        samples = [0] * n
+        fix_count = 0
+        prev = 0
+
+        for i in range(n):
+            offset = i * 2
+            # 小端序读取为无符号
+            uv = data[offset] | (data[offset + 1] << 8)
+            # 当前有符号解释
+            sv = (uv - 0x10000) if uv >= 0x8000 else uv
+
+            # 检测与前一个样本的跳变
+            jump = abs(sv - prev)
+            if jump > JUMP_THRESHOLD:
+                # 尝试翻转符号：如果 uv >= 0x8000（当前解释为负），
+                # 翻转为正（uv 本身）；否则翻转为负（uv - 0x10000）
+                alt = uv if uv >= 0x8000 else (uv - 0x10000)
+                # 钳位备选值
+                if alt > 32767:
+                    alt = 32767
+                elif alt < -32768:
+                    alt = -32768
+                alt_jump = abs(alt - prev)
+                if alt_jump < jump:
+                    sv = alt
+                    fix_count += 1
+
+            # 最终钳位（安全网）
+            if sv > 32767:
+                sv = 32767
+            elif sv < -32768:
+                sv = -32768
+            samples[i] = sv
+            prev = sv
+
+        # 第二遍：平滑处理钳位区域（被钳位到极值的样本用邻域平均值替代）
+        smoothed = 0
+        for i in range(n):
+            if abs(samples[i]) >= 32700:  # 被钳位到极值附近
+                left_vals = []
+                right_vals = []
+                # 向左找非钳位样本
+                for j in range(i - 1, max(i - SMOOTH_WINDOW - 1, -1), -1):
+                    if abs(samples[j]) < 30000:
+                        left_vals.append(samples[j])
+                        if len(left_vals) >= 3:
+                            break
+                # 向右找非钳位样本
+                for j in range(i + 1, min(i + SMOOTH_WINDOW + 1, n)):
+                    if abs(samples[j]) < 30000:
+                        right_vals.append(samples[j])
+                        if len(right_vals) >= 3:
+                            break
+
+                if left_vals and right_vals:
+                    # 用左右非钳位样本的加权平均值替代
+                    left_avg = sum(left_vals) / len(left_vals)
+                    right_avg = sum(right_vals) / len(right_vals)
+                    left_w = 1.0 / (len(left_vals) + 1)
+                    right_w = 1.0 / (len(right_vals) + 1)
+                    samples[i] = int((left_avg * left_w + right_avg * right_w) / (left_w + right_w))
+                    smoothed += 1
+
+        # 写回小端序
+        out = bytearray(len(data))
+        for i in range(n):
+            offset = i * 2
+            sv = samples[i]
+            uo = (sv + 0x10000) if sv < 0 else sv
+            out[offset] = uo & 0xFF
+            out[offset + 1] = (uo >> 8) & 0xFF
+
+        # 奇数长度防御
+        if len(data) % 2:
+            out[-1] = data[-1]
+
+        logger.info(f"[{device_id}] _fix_brtc_overflow: fixed {fix_count}/{n} samples, smoothed {smoothed}")
+        return bytes(out)
+
     def _get_brtc_config(self):
         """构造大模型互动实例配置对象"""
         config_dict = {
             "audiocodec": "raw16k",
             "dfda": True,  # 启用 Digital Full-Duplex Audio
-            "asr_vad_level": getattr(settings, "BRTC_ASR_VAD_LEVEL", 45), # 人声检测灵敏度，默认 45
-            "vol": 2.0,  # 全局 TTS 音量
-            "cloud_3A_url": {
-                "ANS": {
-                    "enable": True,
-                    "preMode": "VH",
-                    "midGainDb": 0,
-                    "dfLimitDb": 10
-                },
-                "AGC": {
-                    "enable": True,
-                    "maxVolume": 60,
-                    "extraGain": 0
-                }
+            "asr_vad_level": getattr(settings, "BRTC_ASR_VAD_LEVEL", 45)  # 人声检测灵敏度，默认 45
+        }
+
+        # TTS参数：针对韩语降低音量以避免溢出
+        if getattr(self, 'lang', '') == 'ko':
+            config_dict["vol"] = 0.3  # 显著降低音量
+        else:
+            config_dict["vol"] = 1.0
+            
+        config_dict["cloud_3A_url"] = {
+            "ANS": {
+                "enable": True,
+                "preMode": "VH",
+                "midGainDb": 0,
+                "dfLimitDb": 10
+            },
+            "AGC": {
+                "enable": False,  # 关闭 AGC，避免与 TTS vol 叠加导致削波
+                "maxVolume": 60,
+                "extraGain": 0
             }
         }
         if getattr(self, 'lang', None):
@@ -506,6 +615,28 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
                 return  # 八字节心跳/保活包，直接丢弃
             if self._interrupted:
                 return
+            
+            # DEBUG: 保存 BRTC 原始音频字节，用于排查韩语滋滋声问题
+            if not hasattr(self, '_brtc_raw_fh'):
+                import datetime as _dt
+                ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                fname = os.path.join(settings.BASE_DIR, f"debug_brtc_raw_{self.lang or 'default'}_{self.device.device_id}_{ts}.pcm")
+                self._brtc_raw_fh = open(fname, "wb")
+                self._brtc_raw_count = 0
+                self._brtc_raw_bytes = 0
+                logger.info(f"[{self.device.device_id}] Saving BRTC raw audio to: {fname}")
+            self._brtc_raw_fh.write(message)
+            self._brtc_raw_count += 1
+            self._brtc_raw_bytes += len(message)
+            if self._brtc_raw_count <= 5 or self._brtc_raw_count % 50 == 0:
+                logger.info(f"[{self.device.device_id}] BRTC raw msg #{self._brtc_raw_count}: {len(message)}B, "
+                           f"total {self._brtc_raw_bytes}B ({self._brtc_raw_bytes/32000:.1f}s)")
+            
+            # WORKAROUND: 百度 BRTC 韩语 TTS 引擎 bug — float→int16 转换溢出，
+            # 正溢出回绕为负值导致滋滋声。此处检测并修复溢出样本。
+            if getattr(self, 'lang', '') == 'ko':
+                message = self._fix_brtc_overflow(message, self.device.device_id)
+            
             CHUNK_SIZE = 1600 # 32000 bytes/sec * 0.05 sec
             for i in range(0, len(message), CHUNK_SIZE):
                 chunk = message[i:i+CHUNK_SIZE]
@@ -566,6 +697,16 @@ class ChatBotConsumer(AsyncWebsocketConsumer):
             duration = time.time() - self.session_start_time
             add_usage(self.device.device_id, duration)
             print(f"[{self.device.device_id}] Disconnected. Duration: {duration}s added.")
+        
+        # 主动清除 BRTC token 缓存，防止新消费者复用旧 BRTC 实例的 token
+        if hasattr(self, 'device') and self.device:
+            _brtc_token_cache.pop(self._brtc_cache_key(), None)
+        
+        # 关闭 BRTC 原始音频调试文件
+        if hasattr(self, '_brtc_raw_fh') and self._brtc_raw_fh:
+            self._brtc_raw_fh.close()
+            logger.info(f"[{self.device.device_id}] BRTC raw audio saved: "
+                       f"{self._brtc_raw_count} msgs, {self._brtc_raw_bytes}B")
         
         # 取消心跳任务
         if hasattr(self, '_keepalive_task'):
